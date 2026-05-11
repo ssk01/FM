@@ -49,35 +49,96 @@ u.item:  1|Toy Story (1995)|...|0|0|0|1|1|1|0|0|0|0|0|0|0|0|0|0|0|0|0
 - **occ 贡献微弱（+0.005）**，user_id 已隐式编码了职业信息
 - **两者叠加 +0.015**，略低于独立贡献之和（信息重叠）
 
+## 五个模型 Test AUC
+
+| 模型 | Test AUC | 说明 |
+|---|---|---|
+| MF (`mf.py`) | 0.7278 | baseline |
+| MF+occ+genre (`fm_demo.py`) | 0.7430 | 跨侧 sum-pool，缺同侧交叉 |
+| **完整 FM (`true_fm.py`)** | **0.7829** | 补回 ⟨u,o⟩、⟨g_a,g_b⟩，+0.04 |
+| 双塔 norm+τ (`two_tower_norm.py`) | 0.7501 | cosine / 0.07 + BCE |
+| 双塔 sampled softmax | 0.6017 | 优化的是 retrieval ranking，AUC 与上面不可比 |
+
 ## 评价指标 — AUC
 
 将测试集每个 (user, item) 输入模型得到 logit（`sigmoid` 后为 CTR），与真实 label 计算 ROC-AUC。
 
 AUC 含义：随机抽一个正样本、一个负样本，模型把正样本排在前面的概率。随机模型 AUC=0.5，理想模型 AUC=1.0。
 
-## 向量化 Trick（多快好省的核心）
+## FM 的两个核心 trick
 
-将特征分为 User 侧和 Item 侧，利用内积分配率：
+### Trick 1 — Rendle 2010：O(k·n) 算两两交叉
 
-$$
-\sum_{i \in U}\sum_{j \in I} \langle \mathbf{v}_i, \mathbf{v}_j \rangle = \left\langle \sum_{i \in U} \mathbf{v}_i,\; \sum_{j \in I} \mathbf{v}_j \right\rangle
-$$
+朴素地写 FM 二阶项是 O(n²)：
 
-把 bias 项也分配到两侧，各得到一个定长向量，CTR 退化为点积：
+```
+2nd_order = Σ_{i<j} <v_i, v_j>·x_i·x_j
+```
 
-$$
-\text{CTR} = \sigma(\langle \mathbf{u}, \mathbf{i} \rangle)
-$$
+n=10⁶ 特征 × k=64 维 embedding，一条样本要 6×10¹³ 次乘加，**跑不动**。
 
-在线 inference 只需读取两向量做 dot，无需复杂模型计算。
+用平方差恒等式：
 
-### 四重用途
+```
+||a + b||²  =  ||a||² + ||b||² + 2·<a, b>
+```
+
+n 个向量推广：
+
+```
+|| Σᵢ xᵢ·vᵢ ||²  =  Σᵢ xᵢ²·||vᵢ||²  +  2 · Σ_{i<j} xᵢ·xⱼ·<vᵢ, vⱼ>
+```
+
+移项得到 FM 的核心公式：
+
+```
+Σ_{i<j} xᵢ·xⱼ·<vᵢ, vⱼ>  =  0.5 · ( || Σᵢ xᵢ·vᵢ ||²  -  Σᵢ xᵢ²·||vᵢ||² )
+                                  ↑ S 求一次             ↑ 自己平方加一次
+                                  O(k·nnz)              O(k·nnz)
+```
+
+复杂度从 **O(k·n²) → O(k·nnz)**（nnz = 非零特征数 ~50）。100w 特征一条样本 3000 次乘加搞定，**快 10⁹ 倍**，且**结果完全等价、不是近似**。
+
+`true_fm.py:99` 就是这两行：
+```python
+S_i  = ie + g_sum                           # Σ x_i·v_i  (item 侧)
+SS_i = (ie*ie).sum(-1) + ((g_emb**2).sum(-1) * genres).sum(-1)
+cross_item = 0.5 * ((S_i*S_i).sum(-1) - SS_i)
+```
+
+### Trick 2 — 九老师：完整 FM 也能压成单次点积
+
+把 Trick 1 拿到的两两交叉按"在哪一侧"分成 3 块：
+
+```
+Σ_{i<j} = Σ_{i<j ∈ U} + Σ_{i<j ∈ I} + Σ_{i∈U, j∈I}
+        = cross_user   + cross_item   + cross_ui
+```
+
+跨侧那块本来就能化成 `<S_u, S_i>`。**关键 insight：cross_user 和 cross_item 都是标量**——把它们当成一维"附加分"塞进 user_vec / item_vec：
+
+```
+user_vec = [ S_u, 1,                  W_user + cross_user ]    维度 = k + 2
+item_vec = [ S_i, W_item + cross_item, 1                  ]    维度 = k + 2
+```
+
+点积展开 → `<S_u, S_i>` + `1·(W_item + cross_item)` + `(W_user + cross_user)·1` = **完整 FM 输出**，一字不差。
+
+实测 (true_fm.py)：
+```
+max |model_logit - vec_dot|  =  9.5e-7   ← 浮点误差量级
+vector AUC  =  0.7829   (model AUC = 0.7829)
+```
+
+### 四重用途（trick 2 解锁的）
 
 | 用法 | 在线方式 | 候选规模 |
 |------|----------|----------|
 | **CTR 预估（排序）** | `sigmoid(dot(user_vec, item_vec))` | 上百 |
 | **粗排** | 从 KV 取 item_vec，逐一点积 | 上万 |
-| **向量召回** | FAISS 索引 + 内积检索 | 百万级 |
+| **向量召回** | FAISS IndexFlatIP 内积检索 | 百万级 |
+
+只要离线把每个 user / item 算一次定长向量塞 KV / FAISS，三场全用同一份向量服务，**多快好省**。
 
 ## 运行
 
