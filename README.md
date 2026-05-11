@@ -1,6 +1,16 @@
-# MF / MF + Side Features — 向量化召回/粗排/排序 Demo
+# MF / FM / 双塔 — 向量化召回/粗排/排序 Demo
 
-本仓库从 Matrix Factorization 出发，逐步加入 side features，并应用九老师介绍的向量化 trick（将 user/item 侧特征各自聚合成定长向量），实现一套向量同时服务召回、粗排、排序。
+本仓库从 Matrix Factorization 出发，对照实现四种模型，重点演示**九老师讲的"完整 FM 也能无损向量化"**这一 trick：
+
+| 模型 | 二阶交叉范围 | Loss | 向量化 |
+|---|---|---|---|
+| `mf.py` | user × item | BCE | dot |
+| `fm_demo.py` | 仅跨侧 sum-pool（≠ 真 FM） | BCE | dot |
+| `true_fm.py` | **完整 FM**（含同侧交叉） | BCE | **无损** dot（九老师 trick） |
+| `two_tower_norm.py` | 跨侧 sum-pool | BCE | cosine / τ=0.07 |
+| `two_tower_sampled_softmax.py` | 跨侧 sum-pool | in-batch sampled softmax | cosine / τ=0.07 |
+
+> 警告：`fm_demo.py` 的命名其实是双塔 sum-pool 模型，**不是真 FM**——它只算了跨侧交叉，丢了 ⟨user_id, occ⟩、⟨genre_a, genre_b⟩ 等同侧两两交叉。`true_fm.py` 把这两项也补回来，并演示如何把它们当成标量塞进 user_vec / item_vec 的某一维，实现 `<u_vec, i_vec> ≡ 完整FM输出`（max diff < 1e-6）。
 
 ## 数据集
 
@@ -77,8 +87,17 @@ pip install torch numpy scikit-learn faiss-cpu
 # Pure MF
 python3 mf.py
 
-# MF + Side Features（含 FAISS 召回 Demo）
+# 双塔 sum-pool（README 警告：命名叫 fm_demo，其实不是真 FM）
 python3 fm_demo.py
+
+# 真正的 FM（含同侧交叉）+ 九老师无损向量化 trick
+python3 true_fm.py
+
+# L2-normalized 双塔，τ=0.07，BCE
+python3 two_tower_norm.py
+
+# 双塔 + in-batch sampled softmax (InfoNCE)，τ=0.07
+python3 two_tower_sampled_softmax.py
 
 # 消融实验（4 个模型对比）
 python3 ablation.py
@@ -91,14 +110,17 @@ python3 bce_demo.py
 
 ```
 FM/
-├── mf.py             # Pure Matrix Factorization（baseline）
-├── mf_feature.py     # No user ID, only occupation features（cold-start demo）
-├── fm_demo.py        # MF + occ + genre，含向量化 serving 和 FAISS 召回 Demo
-├── ablation.py       # 消融实验：量化 occ / genre 各自贡献
-├── bce_demo.py       # 手算 BCEWithLogitsLoss 的 standalone demo
-├── TRAINING_LOGS.md  # 各模型训练日志
+├── mf.py                            # Pure Matrix Factorization（baseline）
+├── mf_feature.py                    # No user ID, only occ（cold-start demo）
+├── fm_demo.py                       # 双塔 sum-pool（命名叫 fm，但其实不是 FM）
+├── true_fm.py                       # 完整 FM（含同侧交叉）+ 九老师无损向量化
+├── two_tower_norm.py                # 双塔 L2-norm + τ=0.07 + BCE
+├── two_tower_sampled_softmax.py     # 双塔 + in-batch sampled softmax
+├── ablation.py                      # 消融：量化 occ / genre 贡献
+├── bce_demo.py                      # 手算 BCEWithLogitsLoss
+├── TRAINING_LOGS.md
 ├── README.md
-└── ml-100k/          # （自动下载）MovieLens 100k
+└── ml-100k/                         # 自动下载
 ```
 
 ## 参考文献
